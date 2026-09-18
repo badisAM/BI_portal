@@ -1,99 +1,215 @@
 <?php
-include("config.php");
-if(!isset($_SESSION['role']) || $_SESSION['role']!="admin"){
-    header("Location: login.php"); exit;
+/**
+ * config_employes.php — Gestion des utilisateurs
+ *
+ * ── Ce qui a été corrigé ──────────────────────────────────────────────────
+ *
+ *  Avant :
+ *      $id = (int)$_GET['toggle'];
+ *      $conn->query("UPDATE users SET actif = 1-actif WHERE id=$id");
+ *
+ *  Le transtypage en (int) protégeait bien de l'injection SQL, mais
+ *  l'action restait déclenchable par un simple lien GET. Une image
+ *  <img src="…/config_employes.php?toggle=1"> placée sur une autre page
+ *  suffisait à désactiver un compte à l'insu de l'administrateur connecté
+ *  (falsification de requête inter-sites, ou CSRF).
+ *
+ *  Maintenant : l'action passe par un formulaire POST accompagné d'un
+ *  jeton de session, et un administrateur ne peut pas se désactiver.
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/partials/layout.php';
+
+require_role('admin');
+
+$info = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle'])) {
+    if (!csrf_valid($_POST['csrf'] ?? null)) {
+        $info = 'Session expirée — aucune modification effectuée.';
+    } else {
+        $id   = (int) $_POST['toggle'];
+        $cible = find_user_by_id($id);
+
+        if ($cible === null) {
+            $info = 'Utilisateur introuvable.';
+        } elseif ($cible['role'] === 'admin') {
+            $info = 'Un compte administrateur ne peut pas être désactivé.';
+        } else {
+            toggle_user($id);
+            $apres = find_user_by_id($id);
+            $info  = sprintf(
+                'Compte « %s » %s.',
+                $apres['nom'],
+                (int) $apres['actif'] === 1 ? 'activé' : 'désactivé'
+            );
+        }
+    }
 }
 
-if(isset($_GET['toggle'])){
-    $id=(int)$_GET['toggle'];
-    $conn->query("UPDATE users SET actif = 1-actif WHERE id=$id");
+$users  = all_users();
+$actifs = count(array_filter($users, static fn ($u) => (int) $u['actif'] === 1));
+
+// Décompte par rôle, pour le bandeau d'indicateurs.
+$parRole = [];
+foreach ($users as $u) {
+    $parRole[$u['role']] = ($parRole[$u['role']] ?? 0) + 1;
 }
 
-$result=$conn->query("SELECT * FROM users WHERE role <> 'admin' ORDER BY role,nom");
+layout_start(
+    'Gestion des utilisateurs',
+    'Comptes, rôles et droits d\'accès',
+    'users'
+);
 ?>
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gestion Utilisateurs</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,Segoe UI,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
-header{background:#1e293b;padding:14px 28px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155;position:sticky;top:0;z-index:10}
-header h1{font-size:1.1rem;font-weight:700;color:#38bdf8}
-header nav a{color:#94a3b8;text-decoration:none;margin-left:18px;font-size:.83rem}
-header nav a:hover{color:#e2e8f0}
-.page{padding:22px 24px;display:grid;gap:20px}
-.card{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #334155}
-.card h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
-.tbl{width:100%;border-collapse:collapse;font-size:.82rem}
-.tbl th{color:#64748b;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid #334155}
-.tbl td{padding:6px 8px;border-bottom:1px solid #ffffff08}
-.tbl tr:last-child td{border:none}
-.tbl tr:hover td{background:#ffffff06}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.73rem;font-weight:600}
-.b-green{background:#22c55e20;color:#4ade80}
-.b-red{background:#ef444420;color:#f87171}
-.b-blue{background:#0ea5e920;color:#38bdf8}
-.b-purple{background:#a855f720;color:#c084fc}
-.btn-toggle{display:inline-block;padding:4px 12px;border-radius:6px;font-size:.75rem;font-weight:600;text-decoration:none;transition:opacity .2s}
-.btn-toggle:hover{opacity:.8}
-.btn-desact{background:#ef444420;color:#f87171;border:1px solid #ef444430}
-.btn-act{background:#22c55e20;color:#4ade80;border:1px solid #22c55e30}
-</style>
-</head>
-<body>
-<header>
-  <h1>👥 Gestion Utilisateurs</h1>
-  <nav>
-    <a href="admin.php">← Admin</a>
-    <a href="dashboard_ml.php">📊 Dashboard ML</a>
-    <a href="logout.php">Déconnexion</a>
-  </nav>
-</header>
 
-<div class="page">
-  <div class="card">
-    <h2><span class="dot" style="background:#38bdf8"></span>Liste des utilisateurs</h2>
+<?php if ($info !== ''): ?>
+  <div class="alert alert-info">
+    <span class="ico" aria-hidden="true">ℹ</span>
+    <span><?= e($info) ?></span>
+  </div>
+<?php endif; ?>
+
+<section class="kpis" aria-label="Répartition des comptes">
+  <article class="kpi" style="--accent:var(--s1)">
+    <div class="lbl">Comptes</div>
+    <div class="val"><?= count($users) ?></div>
+    <div class="note"><?= $actifs ?> actif(s), <?= count($users) - $actifs ?> désactivé(s)</div>
+  </article>
+  <?php
+  $accents = ['admin' => 'var(--s7)', 'commercial' => 'var(--s3)', 'employe' => 'var(--s4)'];
+  foreach (ROLE_LABELS as $role => $label): ?>
+    <article class="kpi" style="--accent:<?= e($accents[$role] ?? 'var(--s1)') ?>">
+      <div class="lbl"><?= e($label) ?></div>
+      <div class="val"><?= (int) ($parRole[$role] ?? 0) ?></div>
+      <div class="note"><?= $role === 'admin' ? 'Accès complet' : ($role === 'commercial' ? 'Rapports + modèles' : 'Rapports de vente') ?></div>
+    </article>
+  <?php endforeach; ?>
+</section>
+
+<section class="card">
+  <h2><span class="rule"></span>Liste des comptes</h2>
+  <p class="hint">
+    Les administrateurs figurent dans la liste mais ne sont pas désactivables,
+    afin de ne pas se verrouiller hors du portail.
+  </p>
+
+  <div class="tbl-wrap">
     <table class="tbl">
-      <tr>
-        <th>Nom</th>
-        <th>Email</th>
-        <th>Rôle</th>
-        <th>État</th>
-        <th>Action</th>
-      </tr>
-      <?php while($u=$result->fetch_assoc()): ?>
-      <tr>
-        <td><?= htmlspecialchars($u['nom']) ?></td>
-        <td style="color:#94a3b8"><?= htmlspecialchars($u['email']) ?></td>
-        <td>
-          <?php if($u['role']==='commercial'): ?>
-            <span class="badge b-blue">Commercial</span>
-          <?php elseif($u['role']==='employe'): ?>
-            <span class="badge b-purple">Employé</span>
-          <?php else: ?>
-            <span class="badge b-blue"><?= htmlspecialchars($u['role']) ?></span>
-          <?php endif; ?>
-        </td>
-        <td>
-          <?php if($u['actif']): ?>
-            <span class="badge b-green">Actif</span>
-          <?php else: ?>
-            <span class="badge b-red">Inactif</span>
-          <?php endif; ?>
-        </td>
-        <td>
-          <a href="?toggle=<?= $u['id'] ?>" class="btn-toggle <?= $u['actif'] ? 'btn-desact' : 'btn-act' ?>">
-            <?= $u['actif'] ? 'Désactiver' : 'Activer' ?>
-          </a>
-        </td>
-      </tr>
-      <?php endwhile; ?>
+      <caption class="sr-only">Comptes utilisateurs du portail</caption>
+      <thead>
+        <tr>
+          <th scope="col">Nom</th>
+          <th scope="col">Email</th>
+          <th scope="col">Fonction</th>
+          <th scope="col">Rôle</th>
+          <th scope="col">État</th>
+          <th scope="col">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php foreach ($users as $u):
+            $estMoi  = (int) $u['id'] === (int) ($_SESSION['id'] ?? 0);
+            $estAdmin = $u['role'] === 'admin';
+            $badge = ['admin' => 'badge-violet', 'commercial' => 'badge-green', 'employe' => 'badge-blue'][$u['role']] ?? 'badge-slate';
+        ?>
+        <tr>
+          <th scope="row" style="font-weight:600">
+            <?= e($u['nom']) ?>
+            <?php if ($estMoi): ?>
+              <span class="badge badge-slate" style="margin-left:5px">vous</span>
+            <?php endif; ?>
+          </th>
+          <td style="color:var(--ink-2)"><?= e($u['email']) ?></td>
+          <td style="color:var(--ink-muted)"><?= e($u['poste']) ?></td>
+          <td><span class="badge <?= $badge ?>"><?= e(ROLE_LABELS[$u['role']] ?? $u['role']) ?></span></td>
+          <td>
+            <?php if ((int) $u['actif'] === 1): ?>
+              <span class="badge badge-green">Actif</span>
+            <?php else: ?>
+              <span class="badge badge-red">Inactif</span>
+            <?php endif; ?>
+          </td>
+          <td>
+            <?php if ($estAdmin): ?>
+              <span style="color:var(--ink-muted);font-size:.765rem">Protégé</span>
+            <?php else: ?>
+              <!-- POST + jeton : l'action ne peut plus être déclenchée
+                   depuis un site tiers. -->
+              <form method="POST" action="" style="display:inline">
+                <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                <input type="hidden" name="toggle" value="<?= (int) $u['id'] ?>">
+                <button type="submit"
+                        class="btn btn-sm <?= (int) $u['actif'] === 1 ? 'btn-danger' : 'btn-ok' ?>">
+                  <?= (int) $u['actif'] === 1 ? 'Désactiver' : 'Activer' ?>
+                </button>
+              </form>
+            <?php endif; ?>
+          </td>
+        </tr>
+        <?php endforeach; ?>
+      </tbody>
     </table>
   </div>
-</div>
-</body>
-</html>
+
+  <div class="alert alert-warn" style="margin-top:18px">
+    <span class="ico" aria-hidden="true">⚠</span>
+    <span>
+      <strong>Portée des modifications.</strong> En mode démonstration, les
+      activations et désactivations sont conservées dans votre session et
+      remises à zéro à la déconnexion. Le portail ne peut donc pas écrire sur le
+      disque du serveur — ce qui lui permet de tourner sur un hébergement en
+      lecture seule. Pour rendre les changements permanents, remplacez
+      <code class="inline">toggle_user()</code> dans
+      <code class="inline">auth.php</code> par une écriture en base de données.
+    </span>
+  </div>
+</section>
+
+<section class="card">
+  <h2><span class="rule" style="background:var(--s3)"></span>Droits par rôle</h2>
+  <p class="hint">Ce que chaque rôle peut ouvrir dans le portail.</p>
+
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <caption class="sr-only">Matrice des droits d'accès</caption>
+      <thead>
+        <tr>
+          <th scope="col">Page</th>
+          <th scope="col">Administrateur</th>
+          <th scope="col">Commercial</th>
+          <th scope="col">Employé</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php
+        $matrice = [
+            'Vue générale sur vente'    => ['admin', 'commercial', 'employe'],
+            'Performance produits'      => ['admin', 'commercial', 'employe'],
+            'Analyse des paiements'     => ['admin', 'commercial'],
+            'Prédiction & Data Mining'  => ['admin', 'commercial'],
+            'Gestion des utilisateurs'  => ['admin'],
+        ];
+        foreach ($matrice as $page => $autorises): ?>
+        <tr>
+          <th scope="row" style="font-weight:500"><?= e($page) ?></th>
+          <?php foreach (['admin', 'commercial', 'employe'] as $r): ?>
+            <td>
+              <?php if (in_array($r, $autorises, true)): ?>
+                <span class="badge badge-green">✓ Autorisé</span>
+              <?php else: ?>
+                <span class="badge badge-slate">— Refusé</span>
+              <?php endif; ?>
+            </td>
+          <?php endforeach; ?>
+        </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<?php layout_end(); ?>

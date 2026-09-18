@@ -1,0 +1,49 @@
+# ── Secrets ───────────────────────────────────────────────────────────────
+# Rien de sensible ne doit entrer dans le dépôt. Un secret commité reste
+# dans l'historique même après suppression : il faut le révoquer.
+.env
+.env.*
+!.env.example
+config.local.php
+*.key
+*.pem
+
+# ── Dépendances ───────────────────────────────────────────────────────────
+/vendor/
+/node_modules/
+composer.lock
+
+# ── Journaux et fichiers temporaires ──────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# ── Données ───────────────────────────────────────────────────────────────
+# Les extractions et sauvegardes n'ont pas leur place sous Git : elles sont
+# volumineuses, se versionnent mal et contiennent des données d'entreprise.
+/data/exports/
+*.sql
+*.sqlite
+*.csv.gz
+
+# ── Power BI ──────────────────────────────────────────────────────────────
+# Un .pbix est un binaire qui embarque souvent les données importées.
+# Préférez le format .pbip (arborescence de fichiers texte), qui se
+# compare et se fusionne correctement.
+*.pbix
+~$*.pbix
+.pbi/
+TempState/
+
+# ── Modèles volumineux ────────────────────────────────────────────────────
+# Décommentez si les .pkl dépassent 50 Mo — utilisez alors Git LFS.
+# *.pkl
+
+# ── Systèmes d'exploitation et éditeurs ───────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

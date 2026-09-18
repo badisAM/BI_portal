@@ -1,487 +1,483 @@
 <?php
-include("config.php");
-if(!isset($_SESSION['role']) || $_SESSION['role']!="admin"){
-    header("Location: login.php"); exit;
-}
+/**
+ * dashboard_ml.php — Prédiction et data mining
+ *
+ * Reprend les quatre blocs du tableau de bord d'origine :
+ *   1. Prévision du chiffre d'affaires (série temporelle)
+ *   2. Prédiction de CA par produit (formulaire)
+ *   3. Segmentation des produits (K-Means)
+ *   4. Règles d'association (FP-Growth)
+ *
+ * La différence : plus aucun appel à Python. Les résultats des modèles
+ * sont servis depuis data/ml_data.php. Voir l'en-tête de ce fichier pour
+ * le détail de ce qui est réel et de ce qui est reconstitué.
+ */
 
-$MODELS_DIR = "C:/xampp/htdocs/bi_portal/models";
-$PYTHON = "python";
+declare(strict_types=1);
 
-function py(string $script): array {
-    global $PYTHON;
-    $tmp = tempnam(sys_get_temp_dir(), 'dash_') . '.py';
-    file_put_contents($tmp, $script);
-    $out = shell_exec("$PYTHON " . escapeshellarg($tmp) . " 2>&1");
-    unlink($tmp);
-    // Ignore warnings/prints parasites — prend la dernière ligne JSON valide
-    foreach(array_reverse(explode("\n", $out)) as $line){
-        $line = trim($line);
-        if($line === '') continue;
-        $data = json_decode($line, true);
-        if(is_array($data)) return $data;
-    }
-    return ['error' => trim($out)];
-}
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/data/ml_data.php';
+require_once __DIR__ . '/partials/layout.php';
 
-// ── 1. Prophet forecast + historical series ──────────────────────────────────
-$prophet_data = py(<<<PY
-import joblib, json, warnings, numpy as np, pandas as pd
-warnings.filterwarnings('ignore')
-try:
-    m = joblib.load(r"$MODELS_DIR/prophet_ca.pkl")
-    model_type = type(m).__name__
+require_role(['admin', 'commercial']);
 
-    # ── Cas 1 : Prophet ──────────────────────────────────────────────────────
-    try:
-        from prophet import Prophet
-        is_prophet = isinstance(m, Prophet)
-    except Exception:
-        is_prophet = False
-
-    if is_prophet:
-        fut = m.make_future_dataframe(periods=8, freq='W')
-        fc  = m.predict(fut)
-        hist = fc.tail(34)[['ds','yhat','yhat_lower','yhat_upper']]
-        rows = []
-        for i,(_, r) in enumerate(hist.iterrows()):
-            rows.append({'ds': str(r.ds)[:10], 'yhat': round(r.yhat,2),
-                'lower': round(r.yhat_lower,2), 'upper': round(r.yhat_upper,2),
-                'is_future': i >= (len(hist)-8)})
-        print(json.dumps({'ok':True,'rows':rows,'model':model_type}))
-
-    # ── Cas 2 : XGBoost / LinearRegression avec lag features ─────────────────
-    else:
-        import os, pyodbc
-        feat_path = r"$MODELS_DIR/prophet_ca_features.pkl"
-        FEAT_COLS = joblib.load(feat_path) if os.path.exists(feat_path) else \
-            ['t','month','quarter','week','lag_1','lag_2','lag_4','lag_8','lag_13','lag_26','rolling_4','rolling_13']
-
-        # ── Charger historique réel depuis SSMS ──────────────────────────────
-        conn = pyodbc.connect(
-            'DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost;'
-            'DATABASE=DataWarehouse_dhia;UID=sa;PWD=Bedis123;'
-        )
-        df = pd.read_sql("""
-            SELECT DATEADD(DAY, 1-DATEPART(WEEKDAY, d.date_complete),
-                           CAST(d.date_complete AS DATE)) as ds,
-                   SUM(f.montant_ligne) as y
-            FROM FAIT_VENTES f
-            JOIN DIM_DATE d ON f.id_date = d.id_date
-            GROUP BY DATEADD(DAY, 1-DATEPART(WEEKDAY, d.date_complete),
-                             CAST(d.date_complete AS DATE))
-            ORDER BY 1
-        """, conn)
-        conn.close()
-        df['ds'] = pd.to_datetime(df['ds'])
-
-        # Nettoyage outliers (même logique que notebook)
-        Q_low  = df['y'].quantile(0.05)
-        Q_high = df['y'].quantile(0.95)
-        mask = (df['y'] < Q_low) | (df['y'] > Q_high)
-        df.loc[mask, 'y'] = np.nan
-        df['y'] = df['y'].interpolate(method='linear')
-
-        # ── Prévision récursive 12 semaines (exacte comme notebook) ──────────
-        df_ext = df.copy()
-        for _ in range(12):
-            next_ds = df_ext['ds'].max() + pd.Timedelta(weeks=1)
-            row = pd.DataFrame({'ds':[next_ds], 'y':[np.nan]})
-            df_ext = pd.concat([df_ext, row], ignore_index=True)
-            # add_lags inline
-            d = df_ext.copy()
-            d['t']       = np.arange(len(d))
-            d['month']   = d['ds'].dt.month
-            d['quarter'] = d['ds'].dt.quarter
-            d['week']    = d['ds'].dt.isocalendar().week.astype(int)
-            for lag in [1,2,4,8,13,26]:
-                d[f'lag_{lag}'] = d['y'].shift(lag)
-            d['rolling_4']  = d['y'].shift(1).rolling(4).mean()
-            d['rolling_13'] = d['y'].shift(1).rolling(13).mean()
-            feats = d.iloc[[-1]][FEAT_COLS].fillna(0).values
-            df_ext.loc[df_ext.index[-1], 'y'] = float(m.predict(feats)[0])
-
-        # ── Construire les rows : 26 semaines historiques + 12 futures ───────
-        hist_df   = df_ext[df_ext['ds'] <= df['ds'].max()].tail(26)
-        future_df = df_ext[df_ext['ds'] >  df['ds'].max()]
-        rows = []
-        std = float(df['y'].std()) * 0.15  # intervalle confiance approximatif
-        for _, r in hist_df.iterrows():
-            rows.append({'ds': str(r.ds.date()), 'yhat': round(r.y,2),
-                'lower': round(r.y - std,2), 'upper': round(r.y + std,2),
-                'is_future': False})
-        for _, r in future_df.iterrows():
-            rows.append({'ds': str(r.ds.date()), 'yhat': round(r.y,2),
-                'lower': round(r.y - std*1.5,2), 'upper': round(r.y + std*1.5,2),
-                'is_future': True})
-
-        print(json.dumps({'ok':True,'rows':rows,'model':model_type}))
-
-except Exception as e:
-    import traceback
-    print(json.dumps({'ok':False,'error':traceback.format_exc()}))
-PY);
-
-// ── 2. RF prediction (manual input or sample) ────────────────────────────────
-$rf_input = [
-    'id_produit'   => (int)($_POST['id_produit']   ?? 1),
-    'mois'         => (int)($_POST['mois']          ?? (int)date('m')),
-    'annee'        => (int)($_POST['annee']         ?? (int)date('Y')),
-    'nb_commandes' => (int)($_POST['nb_commandes']  ?? 5),
+// ── Formulaire de prédiction ────────────────────────────────────────────
+$saisie = [
+    'id_produit'   => (int) ($_POST['id_produit']   ?? 1),
+    'mois'         => (int) ($_POST['mois']         ?? (int) date('n')),
+    'annee'        => (int) ($_POST['annee']        ?? (int) date('Y')),
+    'nb_commandes' => (int) ($_POST['nb_commandes'] ?? 500),
 ];
-$submitted = isset($_POST['predict']);
 
-$rf_result = py(<<<PY
-import joblib, json, numpy as np, warnings
-warnings.filterwarnings('ignore')
-try:
-    rf = joblib.load(r"$MODELS_DIR/rf_ca_heure.pkl")
-    inp = np.array([[{$rf_input['id_produit']},{$rf_input['mois']},{$rf_input['annee']},{$rf_input['nb_commandes']}]])
-    pred = float(rf.predict(inp)[0])
-    print(json.dumps({'ok':True,'ca':round(pred,2)}))
-except Exception as e:
-    print(json.dumps({'ok':False,'error':str(e)}))
-PY);
+$soumis    = isset($_POST['predire']);
+$resultat  = null;
+$erreurCsrf = false;
 
-// ── 3. Clusters ───────────────────────────────────────────────────────────────
-$cluster_data = py(<<<PY
-import json, os, csv
-f = r"$MODELS_DIR/clusters_produits.csv"
-if os.path.exists(f):
-    from collections import defaultdict
-    sums = defaultdict(lambda:{'ca':0,'qte':0,'count':0})
-    with open(f) as fh:
-        for row in csv.DictReader(fh):
-            c = row.get('cluster','?')
-            sums[c]['ca']    += float(row.get('total_ca',0) or 0)
-            sums[c]['qte']   += float(row.get('total_qte',0) or 0)
-            sums[c]['count'] += 1
-    labels_map = {'0':'Top Vendeur','1':'Produit Lent','2':'Produit Moyen','3':'Premium'}
-    out=[{'cluster':labels_map.get(str(c), 'Cluster '+str(c)),'nb_produits':v['count'],
-          'ca_moyen':round(v['ca']/v['count'],2),
-          'qte_moyenne':round(v['qte']/v['count'],2)}
-         for c,v in sorted(sums.items())]
-    print(json.dumps({'ok':True,'rows':out}))
-else:
-    print(json.dumps({'ok':False,'error':'clusters_produits.csv introuvable — relancez notebook2'}))
-PY);
+if ($soumis) {
+    if (!csrf_valid($_POST['csrf'] ?? null)) {
+        $erreurCsrf = true;
+    } else {
+        $resultat = predire_ca(
+            $saisie['id_produit'],
+            $saisie['mois'],
+            $saisie['annee'],
+            $saisie['nb_commandes']
+        );
+    }
+}
 
-// ── 4. Association rules ──────────────────────────────────────────────────────
-$rules_data = py(<<<PY
-import json, os, csv
-f = r"$MODELS_DIR/association_rules.csv"
-if os.path.exists(f):
-    rows=[]
-    with open(f) as fh:
-        for i,row in enumerate(csv.DictReader(fh)):
-            if i>=10: break
-            rows.append({'antecedents':row.get('antecedents',''),
-                'consequents':row.get('consequents',''),
-                'lift':round(float(row.get('lift',0)),3),
-                'confidence':round(float(row.get('confidence',0)),3)})
-    print(json.dumps({'ok':True,'rows':rows}))
-else:
-    print(json.dumps({'ok':False,'error':'association_rules.csv introuvable — relancez notebook3'}))
-PY);
+$prev     = previsions();
+$maxLift  = max(array_column(REGLES, 'lift'));
+$caGlobal = array_sum(array_column(CLUSTERS, 'ca_total'));
 
+layout_start(
+    'Prédiction & Data Mining',
+    'Prévision de CA, segmentation produits et analyse du panier',
+    'ml'
+);
 ?>
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dashboard ML — Analytique</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Inter,Segoe UI,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
-header{background:#1e293b;padding:14px 28px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155;position:sticky;top:0;z-index:10}
-header h1{font-size:1.1rem;font-weight:700;color:#38bdf8}
-header nav a{color:#94a3b8;text-decoration:none;margin-left:18px;font-size:.83rem}
-header nav a:hover{color:#e2e8f0}
-.page{padding:22px 24px;display:grid;gap:20px}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px}
-.card{background:#1e293b;border-radius:12px;padding:20px;border:1px solid #334155}
-.card-full{grid-column:1/-1}
-.card h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:#64748b;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
-/* table */
-.tbl{width:100%;border-collapse:collapse;font-size:.82rem}
-.tbl th{color:#64748b;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid #334155}
-.tbl td{padding:6px 8px;border-bottom:1px solid #ffffff08}
-.tbl tr:last-child td{border:none}
-.tbl tr:hover td{background:#ffffff06}
-/* badges */
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.73rem;font-weight:600}
-.b-blue{background:#0ea5e920;color:#38bdf8}
-.b-green{background:#22c55e20;color:#4ade80}
-.b-purple{background:#a855f720;color:#c084fc}
-.b-orange{background:#f9731620;color:#fb923c}
-.lift-bar{display:inline-block;height:6px;background:#38bdf8;border-radius:3px;vertical-align:middle;margin-left:6px}
-/* error */
-.err{color:#f87171;font-size:.78rem;padding:10px 12px;background:#7f1d1d33;border-radius:8px;border:1px solid #f8717133;white-space:pre-wrap;word-break:break-word}
-/* predict form */
-.predict-form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:18px}
-.fgroup{display:flex;flex-direction:column;gap:5px}
-.fgroup label{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em}
-.fgroup input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 12px;border-radius:7px;font-size:.85rem;width:130px}
-.fgroup input:focus{outline:none;border-color:#38bdf8}
-.btn{background:#0ea5e9;color:#fff;border:none;padding:8px 20px;border-radius:7px;font-size:.85rem;font-weight:600;cursor:pointer;align-self:flex-end}
-.btn:hover{background:#0284c7}
-/* result box */
-.result-box{background:#0f172a;border-radius:10px;padding:16px 20px;display:flex;align-items:center;gap:16px;border:1px solid #0ea5e940;margin-top:4px}
-.result-box .big{font-size:2rem;font-weight:800;color:#38bdf8}
-.result-box .sub{font-size:.8rem;color:#64748b;margin-top:2px}
-/* chart canvas */
-.chart-wrap{position:relative;height:260px;margin-top:8px}
-</style>
-</head>
-<body>
-<header>
-  <h1>📊 Dashboard ML &amp; Analytique</h1>
-  <nav>
-    <a href="admin.php">← Admin</a>
-    <a href="config_employes.php">Utilisateurs</a>
-    <a href="logout.php">Déconnexion</a>
-  </nav>
-</header>
 
-<div class="page">
+<div class="alert alert-info">
+  <span class="ico" aria-hidden="true">ℹ</span>
+  <span>
+    <strong>Segmentation et règles d'association : résultats réels</strong>, extraits des
+    fichiers <code class="inline">models/clusters_produits.csv</code> et
+    <code class="inline">models/association_rules.csv</code> produits par les notebooks du projet.
+    <strong>Prévision et prédiction : reconstituées</strong> — les modèles
+    <code class="inline">.pkl</code> exigent Python côté serveur, ce qu'aucun hébergement PHP
+    standard ne fournit. La marche à suivre pour les rebrancher est décrite dans le README.
+  </span>
+</div>
 
-  <!-- ══════════════════════════════════════════════════════
-       BLOC 1 — Prévision CA : courbe + tableau
-  ══════════════════════════════════════════════════════ -->
-  <div class="card">
-    <h2><span class="dot" style="background:#38bdf8"></span>Évolution &amp; Prévision CA — Série temporelle
-      <?php if(!empty($prophet_data['model'])): ?>
-        <span class="badge b-blue" style="font-size:.7rem;margin-left:6px"><?= htmlspecialchars($prophet_data['model']) ?></span>
-      <?php endif; ?>
+<div class="grid g-2">
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       BLOC 1 — Prévision du chiffre d'affaires
+       ══════════════════════════════════════════════════════════════════ -->
+  <section class="card span-all">
+    <h2><span class="rule"></span>Prévision du chiffre d'affaires
+      <span class="badge badge-slate" style="margin-left:4px">Série temporelle</span>
     </h2>
-    <?php if(!empty($prophet_data['error'])): ?>
-      <div class="err">⚠ <?= htmlspecialchars($prophet_data['error']) ?></div>
-      <?php if(str_contains($prophet_data['error']??'','prophet')): ?>
-        <p style="color:#64748b;font-size:.78rem;margin-top:10px">💡 Fix : <code>pip install prophet</code></p>
-      <?php endif; ?>
-    <?php elseif(empty($prophet_data['ok'])): ?>
-      <div class="err">Modèle Prophet non chargé.</div>
-    <?php else: ?>
-    <div class="chart-wrap">
-      <canvas id="prophetChart"></canvas>
-    </div>
-    <div style="margin-top:14px">
+    <p class="hint">
+      26 semaines observées, puis 12 semaines de projection. La bande grise
+      est l'intervalle de confiance : il s'élargit avec l'horizon, comme
+      toute prévision honnête.
+    </p>
+
+    <div class="chart tall"><canvas id="cPrev" aria-label="Prévision hebdomadaire du chiffre d'affaires" role="img"></canvas></div>
+    <div class="legend" id="lPrev"></div>
+
+    <div class="tbl-wrap" style="margin-top:16px">
       <table class="tbl">
-        <tr><th>Semaine</th><th>CA prédit</th><th>Borne inf.</th><th>Borne sup.</th><th></th></tr>
-        <?php foreach(array_slice($prophet_data['rows'], -8) as $r): ?>
-        <tr>
-          <td><?= htmlspecialchars($r['ds']) ?></td>
-          <td><span class="badge b-blue"><?= number_format($r['yhat'],2,'.',' ') ?></span></td>
-          <td style="color:#64748b"><?= number_format($r['lower'],2,'.',' ') ?></td>
-          <td style="color:#64748b"><?= number_format($r['upper'],2,'.',' ') ?></td>
-          <td><span class="badge" style="background:#38bdf820;color:#7dd3fc;font-size:.68rem">Prévision</span></td>
-        </tr>
-        <?php endforeach; ?>
+        <caption class="sr-only">Détail des douze semaines de prévision</caption>
+        <thead>
+          <tr>
+            <th scope="col">Semaine du</th>
+            <th scope="col" class="num">CA prévu (DT)</th>
+            <th scope="col" class="num">Borne basse</th>
+            <th scope="col" class="num">Borne haute</th>
+            <th scope="col" class="num">Amplitude</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach (array_filter($prev, static fn ($r) => $r['futur']) as $r): ?>
+          <tr>
+            <th scope="row" style="font-weight:500">
+              <?= e((new DateTimeImmutable($r['ds']))->format('d/m/Y')) ?>
+            </th>
+            <td class="num" style="font-weight:640"><?= money($r['yhat'], 2) ?></td>
+            <td class="num" style="color:var(--ink-muted)"><?= money($r['bas'], 2) ?></td>
+            <td class="num" style="color:var(--ink-muted)"><?= money($r['haut'], 2) ?></td>
+            <td class="num">± <?= money(($r['haut'] - $r['bas']) / 2 / $r['yhat'] * 100, 1) ?> %</td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
       </table>
     </div>
-    <?php endif; ?>
-  </div>
+  </section>
 
-  <!-- ══════════════════════════════════════════════════════
-       BLOC 2 — Saisie manuelle + prédiction RF
-  ══════════════════════════════════════════════════════ -->
-  <div class="card">
-    <h2><span class="dot" style="background:#4ade80"></span>Prédiction CA par produit (Random Forest)</h2>
+  <!-- ══════════════════════════════════════════════════════════════════
+       BLOC 2 — Prédiction de CA par produit
+       ══════════════════════════════════════════════════════════════════ -->
+  <section class="card">
+    <h2><span class="rule" style="background:var(--s3)"></span>Prédiction de CA par produit</h2>
+    <p class="hint">
+      Estime le chiffre d'affaires d'une référence sur un mois donné, à
+      partir de son panier moyen observé et de la saisonnalité.
+    </p>
+
+    <?php if ($erreurCsrf): ?>
+      <div class="alert alert-err" style="margin-bottom:14px">
+        <span class="ico" aria-hidden="true">⚠</span>
+        <span>Session expirée. Rechargez la page et renvoyez le formulaire.</span>
+      </div>
+    <?php endif; ?>
+
     <form method="POST" action="">
-      <div class="predict-form">
-        <div class="fgroup">
-          <label>ID Produit</label>
-          <input type="number" name="id_produit" value="<?= $rf_input['id_produit'] ?>" min="1" required>
+      <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+
+      <div class="form-row">
+        <div class="field" style="flex:2 1 195px">
+          <label for="f_prod">Produit</label>
+          <select name="id_produit" id="f_prod">
+            <?php foreach (CATALOGUE as $p): ?>
+              <option value="<?= $p['id'] ?>" <?= $p['id'] === $saisie['id_produit'] ? 'selected' : '' ?>>
+                <?= e($p['nom']) ?> — <?= money($p['prix'], 2) ?> DT
+              </option>
+            <?php endforeach; ?>
+          </select>
         </div>
-        <div class="fgroup">
-          <label>Mois</label>
-          <input type="number" name="mois" value="<?= $rf_input['mois'] ?>" min="1" max="12" required>
+
+        <div class="field">
+          <label for="f_mois">Mois</label>
+          <select name="mois" id="f_mois">
+            <?php foreach (MOIS as $i => $m): ?>
+              <option value="<?= $i + 1 ?>" <?= ($i + 1) === $saisie['mois'] ? 'selected' : '' ?>><?= e($m) ?></option>
+            <?php endforeach; ?>
+          </select>
         </div>
-        <div class="fgroup">
-          <label>Année</label>
-          <input type="number" name="annee" value="<?= $rf_input['annee'] ?>" min="2020" max="2030" required>
+
+        <div class="field">
+          <label for="f_annee">Année</label>
+          <input type="number" name="annee" id="f_annee" min="2022" max="2030"
+                 value="<?= $saisie['annee'] ?>" required>
         </div>
-        <div class="fgroup">
-          <label>Nb commandes</label>
-          <input type="number" name="nb_commandes" value="<?= $rf_input['nb_commandes'] ?>" min="0" required>
+
+        <div class="field">
+          <label for="f_cmd">Nb commandes</label>
+          <input type="number" name="nb_commandes" id="f_cmd" min="0" step="1"
+                 value="<?= $saisie['nb_commandes'] ?>" required>
         </div>
-        <button class="btn" type="submit" name="predict">Prédire →</button>
+
+        <button class="btn" type="submit" name="predire">Prédire</button>
       </div>
     </form>
 
-    <?php if($submitted): ?>
-      <?php if(!empty($rf_result['ok'])): ?>
-      <div class="result-box">
-        <div>
-          <div class="big"><?= number_format($rf_result['ca'],2,'.',' ') ?> <span style="font-size:1rem;color:#64748b">DT</span></div>
-          <div class="sub">CA prédit — Produit #<?= $rf_input['id_produit'] ?>, <?= $rf_input['mois'] ?>/<?= $rf_input['annee'] ?>, <?= $rf_input['nb_commandes'] ?> commandes</div>
+    <?php if ($resultat !== null && ($resultat['ok'] ?? false)): ?>
+      <?php $d = $resultat['detail']; ?>
+      <div class="kpi" style="--accent:var(--s3);margin-top:18px">
+        <div class="lbl">CA prédit</div>
+        <div class="val"><?= money($resultat['ca'], 2) ?><span class="u">DT</span></div>
+        <div class="note">
+          <?= e($d['produit']) ?> &middot; <?= e(MOIS[$saisie['mois'] - 1]) ?> <?= $saisie['annee'] ?>
+          &middot; <?= money((float) $d['nb_commandes'], 0) ?> commandes
         </div>
       </div>
-      <?php else: ?>
-        <div class="err">⚠ <?= htmlspecialchars($rf_result['error'] ?? 'Erreur inconnue') ?></div>
-        <?php if(str_contains($rf_result['error']??'','xgboost')): ?>
-          <p style="color:#64748b;font-size:.78rem;margin-top:8px">💡 Fix : <code>pip install xgboost</code></p>
-        <?php endif; ?>
-      <?php endif; ?>
-    <?php else: ?>
-      <p style="color:#475569;font-size:.8rem;margin-top:6px">Remplissez les champs et cliquez sur <strong>Prédire</strong>.</p>
-    <?php endif; ?>
-  </div>
 
-  <!-- ══════════════════════════════════════════════════════
-       BLOC 3 — Clusters
-  ══════════════════════════════════════════════════════ -->
-  <div class="card">
-    <h2><span class="dot" style="background:#c084fc"></span>Clustering produits (KMeans)</h2>
-    <?php if(!empty($cluster_data['error'])): ?>
-      <div class="err">⚠ <?= htmlspecialchars($cluster_data['error']) ?></div>
+      <!-- Le calcul est montré : une prédiction que l'on ne peut pas
+           vérifier ne sert à rien en pilotage. -->
+      <div class="tbl-wrap" style="margin-top:14px">
+        <table class="tbl">
+          <caption class="sr-only">Décomposition du calcul</caption>
+          <thead><tr><th scope="col">Facteur</th><th scope="col" class="num">Valeur</th><th scope="col">Origine</th></tr></thead>
+          <tbody>
+            <tr>
+              <th scope="row" style="font-weight:500">Nombre de commandes</th>
+              <td class="num"><?= money((float) $d['nb_commandes'], 0) ?></td>
+              <td style="color:var(--ink-muted)">Saisi</td>
+            </tr>
+            <tr>
+              <th scope="row" style="font-weight:500">Panier moyen du produit</th>
+              <td class="num"><?= money($d['panier'], 4) ?> DT</td>
+              <td style="color:var(--ink-muted)">CA observé / commandes observées</td>
+            </tr>
+            <tr>
+              <th scope="row" style="font-weight:500">Coefficient saisonnier</th>
+              <td class="num">× <?= money($d['coef_mois'], 4) ?></td>
+              <td style="color:var(--ink-muted)"><?= e(MOIS[$saisie['mois'] - 1]) ?> vs mois moyen</td>
+            </tr>
+            <tr>
+              <th scope="row" style="font-weight:500">Coefficient de tendance</th>
+              <td class="num">× <?= money($d['coef_annee'], 4) ?></td>
+              <td style="color:var(--ink-muted)"><?= $saisie['annee'] ?>, base 2023 = 1</td>
+            </tr>
+            <tr class="total">
+              <td>CA prédit</td>
+              <td class="num"><?= money($resultat['ca'], 2) ?> DT</td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    <?php elseif ($resultat !== null): ?>
+      <div class="alert alert-err" style="margin-top:16px">
+        <span class="ico" aria-hidden="true">⚠</span>
+        <span><?= e($resultat['error'] ?? 'Erreur inconnue.') ?></span>
+      </div>
     <?php else: ?>
-    <div class="chart-wrap" style="height:180px"><canvas id="clusterChart"></canvas></div>
-    <table class="tbl" style="margin-top:12px">
-      <tr><th>Cluster</th><th>#Produits</th><th>CA moyen</th><th>Qté moy.</th></tr>
-      <?php foreach($cluster_data['rows'] as $r): ?>
-      <tr>
-        <td><span class="badge b-purple"><?= htmlspecialchars($r['cluster']) ?></span></td>
-        <td><?= (int)$r['nb_produits'] ?></td>
-        <td><?= number_format($r['ca_moyen'],2,'.',' ') ?></td>
-        <td><?= number_format($r['qte_moyenne'],1,'.',' ') ?></td>
-      </tr>
+      <p class="foot-note" style="margin-top:14px">
+        Choisissez un produit et une période, puis lancez la prédiction.
+        Le détail du calcul s'affiche sous le résultat.
+      </p>
+    <?php endif; ?>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       BLOC 3 — Segmentation K-Means
+       ══════════════════════════════════════════════════════════════════ -->
+  <section class="card">
+    <h2><span class="rule" style="background:var(--s4)"></span>Segmentation des produits
+      <span class="badge badge-slate" style="margin-left:4px">K-Means · k=4</span>
+    </h2>
+    <p class="hint">
+      <?= CLUSTERS_NB_PRODUITS ?> références réparties en quatre groupes selon le prix,
+      le volume et la fréquence d'achat.
+    </p>
+
+    <div class="chart short"><canvas id="cClusters" aria-label="CA moyen par segment de produits" role="img"></canvas></div>
+
+    <div class="tbl-wrap" style="margin-top:14px">
+      <table class="tbl">
+        <caption class="sr-only">Caractéristiques des quatre segments</caption>
+        <thead>
+          <tr>
+            <th scope="col">Segment</th>
+            <th scope="col" class="num">Réfs</th>
+            <th scope="col" class="num">CA moyen</th>
+            <th scope="col" class="num">Prix moyen</th>
+            <th scope="col" class="num">Part du CA</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach (CLUSTERS as $c): ?>
+          <tr>
+            <th scope="row" style="font-weight:500">
+              <span class="swatch" style="background:<?= e($c['couleur']) ?>"></span><?= e($c['nom']) ?>
+            </th>
+            <td class="num"><?= $c['nb'] ?></td>
+            <td class="num"><?= money($c['ca_moyen'], 0) ?></td>
+            <td class="num"><?= money($c['prix_moyen'], 2) ?></td>
+            <td class="num"><?= money($c['ca_total'] / $caGlobal * 100, 1) ?> %</td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:grid;gap:9px;margin-top:16px">
+      <?php foreach (CLUSTERS as $c): ?>
+        <div style="border-left:3px solid <?= e($c['couleur']) ?>;padding:2px 0 2px 11px">
+          <div style="font-size:.815rem;font-weight:640"><?= e($c['nom']) ?></div>
+          <div style="font-size:.755rem;color:var(--ink-muted);line-height:1.45">
+            <?= e($c['desc']) ?><br>
+            <span style="color:var(--ink-2)">Ex. : <?= e(implode(', ', $c['exemples'])) ?></span>
+          </div>
+        </div>
       <?php endforeach; ?>
-    </table>
-    <?php endif; ?>
-  </div>
+    </div>
 
-  <!-- ══════════════════════════════════════════════════════
-       BLOC 4 — Association rules
-  ══════════════════════════════════════════════════════ -->
-  <div class="card card-full">
-    <h2><span class="dot" style="background:#fb923c"></span>Top 10 règles d'association (FP-Growth)</h2>
-    <?php if(!empty($rules_data['error'])): ?>
-      <div class="err">⚠ <?= htmlspecialchars($rules_data['error']) ?></div>
-    <?php else: ?>
-    <?php $max_lift = max(array_column($rules_data['rows'],'lift') ?: [1]); ?>
-    <table class="tbl">
-      <tr><th>Si le client achète…</th><th>…il achètera</th><th>Lift</th><th>Confiance</th></tr>
-      <?php foreach($rules_data['rows'] as $r): ?>
-      <tr>
-        <td><code style="color:#fbbf24"><?= htmlspecialchars($r['antecedents']) ?></code></td>
-        <td><code style="color:#34d399"><?= htmlspecialchars($r['consequents']) ?></code></td>
-        <td>
-          <span class="badge b-orange"><?= $r['lift'] ?></span>
-          <span class="lift-bar" style="width:<?= round(($r['lift']/$max_lift)*80) ?>px"></span>
-        </td>
-        <td><?= round($r['confidence']*100,1) ?>%</td>
-      </tr>
-      <?php endforeach; ?>
-    </table>
-    <?php endif; ?>
-  </div>
+    <div class="alert alert-warn" style="margin-top:16px">
+      <span class="ico" aria-hidden="true">⚠</span>
+      <span>
+        <strong>Libellés corrigés.</strong> Le code d'origine étiquetait le cluster 2
+        « Produit Moyen » et le cluster 3 « Premium ». Les chiffres disent l'inverse :
+        c'est le cluster 2 qui réunit les produits chers (6,95 DT en moyenne) à faible
+        rotation. Les libellés ont été réalignés sur les données.
+      </span>
+    </div>
+  </section>
 
-  <!-- Power BI -->
-  <div class="card card-full">
-    <h2><span class="dot" style="background:#e879f9"></span>Power BI — Rapport</h2>
-    <iframe width="100%" height="780"
-      src="https://app.powerbi.com/reportEmbed?reportId=17bc6525-01d3-49e8-af6e-339df47b37c9&autoAuth=true&ctid=604f1a96-cbe8-43f8-abbf-f8eaf5d85730"
-      frameborder="0" style="border-radius:8px;border:none"></iframe>
-  </div>
+  <!-- ══════════════════════════════════════════════════════════════════
+       BLOC 4 — Règles d'association
+       ══════════════════════════════════════════════════════════════════ -->
+  <section class="card span-all">
+    <h2><span class="rule" style="background:var(--s2)"></span>Analyse du panier
+      <span class="badge badge-slate" style="margin-left:4px">FP-Growth</span>
+    </h2>
+    <p class="hint">
+      Couples de produits achetés ensemble plus souvent que le hasard ne le
+      prévoit. Un <em>lift</em> de 3,13 signifie que l'association est trois
+      fois plus fréquente qu'une rencontre fortuite.
+    </p>
 
-</div><!-- /page -->
+    <div class="tbl-wrap">
+      <table class="tbl">
+        <caption class="sr-only">Règles d'association extraites des tickets de caisse</caption>
+        <thead>
+          <tr>
+            <th scope="col">Si le client achète…</th>
+            <th scope="col">… il prend aussi</th>
+            <th scope="col">Lift</th>
+            <th scope="col" class="num">Confiance</th>
+            <th scope="col" class="num">Support</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach (REGLES as $r): ?>
+          <tr>
+            <th scope="row" style="font-weight:500"><?= e($r['si']) ?></th>
+            <td><strong><?= e($r['alors']) ?></strong></td>
+            <td style="min-width:155px">
+              <div style="display:flex;align-items:center;gap:9px">
+                <span class="badge <?= $r['lift'] >= 2 ? 'badge-green' : ($r['lift'] >= 1.5 ? 'badge-amber' : 'badge-slate') ?>">
+                  <?= money($r['lift'], 3) ?>
+                </span>
+                <span style="flex:1;background:var(--surface-sunken);border-radius:3px;height:6px;overflow:hidden">
+                  <span style="display:block;height:100%;border-radius:3px;background:var(--s2);
+                               width:<?= round($r['lift'] / $maxLift * 100, 1) ?>%"></span>
+                </span>
+              </div>
+            </td>
+            <td class="num"><?= money($r['confiance'] * 100, 1) ?> %</td>
+            <td class="num"><?= money($r['support'] * 100, 3) ?> %</td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="alert alert-info" style="margin-top:16px">
+      <span class="ico" aria-hidden="true">→</span>
+      <span>
+        <strong>Lecture opérationnelle.</strong> Les trois règles les plus fortes partent
+        toutes de la viennoiserie ou des gobelets vers une boisson chaude
+        (Direct, Cappucin, Express) : c'est le réflexe petit-déjeuner.
+        Rapprocher physiquement ces références, ou les proposer en formule,
+        est l'action la plus directe que suggère cette analyse.
+      </span>
+    </div>
+  </section>
+
+</div>
 
 <script>
-// ── Série temporelle : historique (bleu) + prévision (orange) ────────────────
-(function(){
-  const all    = <?= json_encode($prophet_data['rows'] ?? []) ?>;
-  if(!all.length) return;
+/* ── Prévision hebdomadaire ───────────────────────────────────────────── */
+(function () {
+  const rows = <?= json_encode($prev) ?>;
+  const labels = rows.map((r) => r.ds);
+  const coupure = rows.findIndex((r) => r.futur);
 
-  const labels = all.map(r => r.ds);
-  const future = all.map(r => r.is_future);
+  // Deux séries distinctes, avec un point de recouvrement pour que la
+  // courbe ne se casse pas visuellement à la jonction.
+  const observe = rows.map((r, i) => (i <= coupure - 1 ? r.yhat : null));
+  const projete = rows.map((r, i) => (i >= coupure - 1 ? r.yhat : null));
+  const haut    = rows.map((r, i) => (i >= coupure - 1 ? r.haut : null));
+  const bas     = rows.map((r, i) => (i >= coupure - 1 ? r.bas  : null));
 
-  // Split en deux séries séparées — overlap d'1 point à la jonction
-  const splitIdx = future.indexOf(true);
-
-  // Historique : points réels
-  const histY = all.map((r,i) => i <= splitIdx ? r.yhat : null);
-  // Prévision : points futurs (+ dernier point historique pour continuité)
-  const futY  = all.map((r,i) => i >= (splitIdx > 0 ? splitIdx-1 : 0) && r.is_future || i === splitIdx-1 ? r.yhat : null);
-  // Bandes confiance futures seulement
-  const bandU = all.map(r => r.is_future ? r.upper : null);
-  const bandL = all.map(r => r.is_future ? r.lower : null);
-
-  new Chart(document.getElementById('prophetChart'), {
-    type:'line',
-    data:{
+  new Chart(document.getElementById('cPrev'), {
+    type: 'line',
+    data: {
       labels,
-      datasets:[
-        // Bande supérieure (fill vers bandL = dataset suivant)
-        { data: bandU, borderColor:'transparent', backgroundColor:'rgba(245,158,11,0.12)',
-          pointRadius:0, fill:'+1', tension:.4, label:'Intervalle' },
-        // Bande inférieure
-        { data: bandL, borderColor:'transparent', backgroundColor:'transparent',
-          pointRadius:0, fill:false, tension:.4, label:'' },
-        // Historique
-        { data: histY, label:'CA réel', borderColor:'#38bdf8',
-          backgroundColor:'transparent', pointRadius:2, pointBackgroundColor:'#38bdf8',
-          tension:.4, fill:false, borderWidth:2.5, spanGaps:false },
-        // Prévision
-        { data: futY, label:'Prévision', borderColor:'#f59e0b',
-          backgroundColor:'transparent', pointRadius:4, pointBackgroundColor:'#f59e0b',
-          tension:.4, fill:false, borderWidth:2.5, borderDash:[6,3], spanGaps:false },
-      ]
+      datasets: [
+        // Bande de confiance : tracée en premier pour rester sous les courbes.
+        { label: 'Intervalle', data: haut, borderColor: 'transparent',
+          backgroundColor: 'rgba(122,134,153,.14)', pointRadius: 0,
+          fill: '+1', tension: .3, order: 3 },
+        { label: '', data: bas, borderColor: 'transparent',
+          backgroundColor: 'transparent', pointRadius: 0, fill: false,
+          tension: .3, order: 3 },
+
+        { label: 'CA observé', data: observe, borderColor: '#2a78d6',
+          backgroundColor: '#2a78d6', borderWidth: 2, pointRadius: 0,
+          pointHoverRadius: 4.5, pointHoverBorderWidth: 2,
+          pointHoverBorderColor: '#fff', tension: .3, order: 1 },
+
+        { label: 'Prévision', data: projete, borderColor: '#eb6834',
+          backgroundColor: '#eb6834', borderWidth: 2, borderDash: [5, 4],
+          pointRadius: 0, pointHoverRadius: 4.5, pointHoverBorderWidth: 2,
+          pointHoverBorderColor: '#fff', tension: .3, order: 2 },
+      ],
     },
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      interaction:{mode:'index', intersect:false},
-      plugins:{
-        legend:{
-          display:true,
-          labels:{color:'#94a3b8', boxWidth:14, font:{size:11},
-            filter: item => item.text !== ''}
+    options: {
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        tooltip: {
+          filter: (item) => item.dataset.label !== '' && item.parsed.y !== null,
+          callbacks: {
+            title: (items) => 'Semaine du '
+              + new Date(items[0].label).toLocaleDateString('fr-FR',
+                  { day: 'numeric', month: 'long', year: 'numeric' }),
+            label: (c) => ' ' + c.dataset.label + ' : ' + BIFmt.n2(c.parsed.y) + ' DT',
+          },
         },
-        tooltip:{
-          backgroundColor:'#1e293b', borderColor:'#334155', borderWidth:1,
-          titleColor:'#e2e8f0', bodyColor:'#94a3b8',
-          callbacks:{
-            label: ctx => {
-              if(ctx.parsed.y === null) return null;
-              const tag = ctx.dataset.label;
-              const val = ctx.parsed.y.toLocaleString('fr-FR',{minimumFractionDigits:0});
-              return ` ${tag}: ${val} DT`;
-            }
-          }
-        }
       },
-      scales:{
-        x:{ ticks:{color:'#475569', maxTicksLimit:10, maxRotation:35},
-            grid:{color:'#1e3a5f33'} },
-        y:{ ticks:{color:'#475569',
-              callback: v => v.toLocaleString('fr-FR')},
-            grid:{color:'#1e3a5f33'} }
-      }
-    }
+      scales: {
+        x: BIAxisX({
+          ticks: {
+            color: '#7a8699', padding: 6, maxRotation: 0, autoSkip: true, maxTicksLimit: 10,
+            callback(v) {
+              return new Date(this.getLabelForValue(v))
+                .toLocaleDateString('fr-FR', { day: '2-digit', month: 'short' });
+            },
+          },
+        }),
+        y: BIAxisY(),
+      },
+    },
   });
+
+  BILegend('lPrev', [
+    { label: 'CA observé (26 semaines)', color: '#2a78d6' },
+    { label: 'Prévision (12 semaines)',  color: '#eb6834' },
+    { label: 'Intervalle de confiance',  color: 'rgba(122,134,153,.45)' },
+  ]);
 })();
 
-// ── Cluster bar chart ─────────────────────────────────────────────────────────
-(function(){
-  const el = document.getElementById('clusterChart');
-  if(!el) return;
-  <?php if(empty($cluster_data['error']) && !empty($cluster_data['rows'])): ?>
-  const labels = <?= json_encode(array_column($cluster_data['rows'],'cluster')) ?>;
-  const ca     = <?= json_encode(array_column($cluster_data['rows'],'ca_moyen')) ?>;
-  new Chart(el, {
-    type:'bar',
-    data:{ labels, datasets:[{ label:'CA moyen', data:ca,
-      backgroundColor:['#38bdf880','#c084fc80','#4ade8080','#fb923c80'],
-      borderRadius:6 }] },
-    options:{responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false}},
-      scales:{x:{ticks:{color:'#475569'},grid:{display:false}},
-              y:{ticks:{color:'#475569'},grid:{color:'#1e3a5f44'}}}}
+/* ── CA moyen par segment ─────────────────────────────────────────────── */
+(function () {
+  const cl = <?= json_encode(array_map(static fn ($c) => [
+      'nom'      => $c['nom'],
+      'ca_moyen' => round($c['ca_moyen'], 2),
+      'nb'       => $c['nb'],
+      'couleur'  => $c['couleur'],
+  ], CLUSTERS), JSON_UNESCAPED_UNICODE) ?>;
+
+  new Chart(document.getElementById('cClusters'), {
+    type: 'bar',
+    data: {
+      // Libellés coupés en deux lignes : « Premium faible volume » sur une
+      // seule ligne chevauchait ses voisins sous la barre.
+      labels: cl.map((c) => {
+        const mots = c.nom.split(' ');
+        return mots.length > 1
+          ? [mots[0], mots.slice(1).join(' ')]
+          : c.nom;
+      }),
+      datasets: [{
+        label: 'CA moyen par référence',
+        data: cl.map((c) => c.ca_moyen),
+        backgroundColor: cl.map((c) => c.couleur),
+        borderRadius: { topLeft: 4, topRight: 4 },
+        borderSkipped: 'bottom',
+        maxBarThickness: 58,
+      }],
+    },
+    options: {
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (c) => ' ' + BIFmt.n0(c.parsed.y) + ' DT en moyenne',
+            afterLabel: (c) => '  sur ' + cl[c.dataIndex].nb + ' références',
+          },
+        },
+      },
+      scales: {
+        x: BIAxisX({ ticks: { color: '#7a8699', padding: 6, maxRotation: 0, autoSkip: false, font: { size: 10 } } }),
+        y: BIAxisY(),
+      },
+    },
   });
-  <?php endif; ?>
 })();
 </script>
-</body>
-</html>
+
+<?php layout_end(); ?>
