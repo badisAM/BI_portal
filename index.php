@@ -1,17 +1,16 @@
 <?php
-/**
- * index.php — Point d'entrée du portail.
- *
- * Renvoie vers l'espace correspondant au rôle, ou vers la page de
- * connexion. Évite d'exposer la liste des fichiers si l'hébergeur
- * autorise le listage de répertoire.
- */
+// Point d'entrée unique : Vercel Hobby n'autorise que 12 fonctions.
+$pages = [
+    'login', 'logout', 'admin', 'dashboard_commercial', 'dashboard_employe',
+    'dashboard_ml', 'config_employes', 'bi_ventes', 'bi_produits', 'bi_paiements',
+];
 
-declare(strict_types=1);
+$p = trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/');
+$p = preg_replace('/\.php$/', '', $p);
 
-require_once __DIR__ . '/auth.php';
+if ($p === '' || !in_array($p, $pages, true)) {
+    require __DIR__ . '/auth.php';
+    $p = is_logged_in() ? rtrim(ROLE_HOME[current_role()] ?? 'login.php', '.php') : 'login';
+}
 
-header('Location: ' . (is_logged_in()
-    ? (ROLE_HOME[current_role()] ?? 'login.php')
-    : 'login.php'));
-exit;
+require __DIR__ . '/' . $p . '.php';
